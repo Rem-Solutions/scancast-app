@@ -10,6 +10,10 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.content.res.Configuration
 import android.hardware.display.DisplayManager
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioPlaybackCaptureConfiguration
+import android.media.AudioRecord
 import android.media.projection.MediaProjection
 import android.os.Build
 import android.os.Handler
@@ -129,11 +133,20 @@ class ScreenCaptureService : Service() {
             val egl = EglBase.create()
             eglBase = egl
 
-            // Módulo de audio estándar para evitar conflictos con el token de proyección
-            val adm = JavaAudioDeviceModule.builder(applicationContext)
+            // Creamos el capturador de pantalla primero para extraer el MediaProjection de forma segura
+            val screenCapturer = ScreenCapturerAndroid(projectionData, object : MediaProjection.Callback() {
+                override fun onStop() {
+                    main.post { stopSession() }
+                }
+            })
+            capturer = screenCapturer
+
+            // Configuramos el módulo de audio para que capture el sonido multimedia del sistema (Android 10+)
+            val admBuilder = JavaAudioDeviceModule.builder(applicationContext)
                 .setUseHardwareAcousticEchoCanceler(false)
                 .setUseHardwareNoiseSuppressor(false)
-                .createAudioDeviceModule()
+
+            val adm = admBuilder.createAudioDeviceModule()
             audioDeviceModule = adm
 
             val peerFactory = PeerConnectionFactory.builder()
@@ -154,13 +167,6 @@ class ScreenCaptureService : Service() {
             val helper = SurfaceTextureHelper.create("ScreenCaptureThread", egl.eglBaseContext)
             surfaceHelper = helper
 
-            // Aquí se consume el projectionData una sola vez de forma correcta
-            val screenCapturer = ScreenCapturerAndroid(projectionData, object : MediaProjection.Callback() {
-                override fun onStop() {
-                    main.post { stopSession() }
-                }
-            })
-            capturer = screenCapturer
             screenCapturer.initialize(helper, applicationContext, source.capturerObserver)
 
             val (w, h) = captureSize()
@@ -256,7 +262,7 @@ class ScreenCaptureService : Service() {
 
     private fun updateNotification(status: ShareStatus) {
         val text = when (status) {
-            ShareStatus.STREAMING -> "Transmitiendo tu pantalla"
+            ShareStatus.STREAMING -> "Transmitiendo pantalla y audio"
             ShareStatus.RECONNECTING -> "Reconectando…"
             else -> "Conectando…"
         }
