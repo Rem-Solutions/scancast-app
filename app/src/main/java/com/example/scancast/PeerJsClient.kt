@@ -50,7 +50,7 @@ private fun randomToken(length: Int): String {
     return buildString { repeat(length) { append(chars[Random.nextInt(chars.length)]) } }
 }
 
-class PeerJsClient(
+class PeerJsSender(
     private val factory: PeerConnectionFactory,
     private val videoTrack: VideoTrack,
     room: String,
@@ -61,7 +61,6 @@ class PeerJsClient(
         const val KIND_MEDIA = "media"
         const val KIND_DATA = "data"
         const val MAX_TRIES = 6
-        // Bitrate aumentado a 6 Mbps para evitar la imagen borrosa
         const val MAX_BITRATE_BPS = 6_000_000
     }
 
@@ -332,3 +331,110 @@ class PeerJsClient(
         private fun sendOffer(offer: SessionDescription) {
             val sdp = JSONObject().put("type", "offer").put("sdp", offer.description)
             val payload = JSONObject()
+                .put("sdp", sdp)
+                .put("type", kind)
+                .put("connectionId", connectionId)
+                .put("browser", "chrome")
+            if (kind == KIND_DATA) {
+                payload.put("label", connectionId)
+                    .put("reliable", true)
+                    .put("serialization", "raw")
+            }
+            send(JSONObject().put("type", "OFFER").put("payload", payload).put("dst", target))
+            offerSent = true
+            pendingLocal.forEach { sendCandidate(it) }
+            pendingLocal.clear()
+        }
+
+        private fun onLocalCandidate(candidate: IceCandidate) {
+            if (isClosed) return
+            if (offerSent) sendCandidate(candidate) else pendingLocal.add(candidate)
+        }
+
+        private fun sendCandidate(candidate: IceCandidate) {
+            val cand = JSONObject()
+                .put("candidate", candidate.sdp)
+                .put("sdpMid", candidate.sdpMid)
+                .put("sdpMLineIndex", candidate.sdpMLineIndex)
+            val payload = JSONObject()
+                .put("candidate", cand)
+                .put("type", kind)
+                .put("connectionId", connectionId)
+            send(JSONObject().put("type", "CANDIDATE").put("payload", payload).put("dst", target))
+        }
+
+        fun onAnswer(sdp: String) {
+            val connection = pc ?: return
+            if (isClosed) return
+            connection.setRemoteDescription(object : SimpleSdpObserver() {
+                override fun onSetSuccess() {
+                    main.post {
+                        if (isClosed) return@post
+                        remoteSet = true
+                        pendingRemote.forEach { connection.addIceCandidate(it) }
+                        pendingRemote.clear()
+                    }
+                }
+                override fun onSetFailure(error: String?) {
+                    main.post { if (!isClosed && kind == KIND_MEDIA) lost() }
+                }
+            }, SessionDescription(SessionDescription.Type.ANSWER, sdp))
+        }
+
+        fun onRemoteCandidate(json: JSONObject) {
+            val line = json.optString("candidate")
+            if (line.isNullOrBlank() || isClosed) return
+            val candidate = IceCandidate(
+                json.optString("sdpMid"),
+                json.optInt("sdpMLineIndex", 0),
+                line
+            )
+            if (remoteSet) pc?.addIceCandidate(candidate) else pendingRemote.add(candidate)
+        }
+
+        private fun onIce(state: PeerConnection.IceConnectionState?) {
+            if (isClosed || kind != KIND_MEDIA || media !== this) return
+            when (state) {
+                PeerConnection.IceConnectionState.CONNECTED,
+                PeerConnection.IceConnectionState.COMPLETED -> {
+                    everConnected = true
+                    tries = 0
+                    cancelRetry()
+                    onStatus(ShareStatus.STREAMING, "")
+                }
+                PeerConnection.IceConnectionState.DISCONNECTED -> {
+                    onStatus(ShareStatus.RECONNECTING, "Conexión inestable…")
+                    main.postDelayed({
+                        if (!isClosed && media === this) {
+                            val current = pc?.iceConnectionState()
+                            if (current == PeerConnection.IceConnectionState.DISCONNECTED ||
+                                current == PeerConnection.IceConnectionState.FAILED
+                            ) lost()
+                        }
+                    }, 5000)
+                }
+                PeerConnection.IceConnectionState.FAILED -> lost()
+                else -> {}
+            }
+        }
+
+        fun sendBye() {
+            val channel = dc ?: return
+            try {
+                if (channel.state() == DataChannel.State.OPEN) {
+                    channel.send(DataChannel.Buffer(ByteBuffer.wrap("bye".toByteArray()), false))
+                }
+            } catch (_: Exception) {
+            }
+        }
+
+        fun close() {
+            if (isClosed) return
+            isClosed = true
+            try { dc?.close(); dc?.dispose() } catch (_: Exception) {}
+            try { pc?.close(); pc?.dispose() } catch (_: Exception) {}
+            dc = null
+            pc = null
+        }
+    }
+}
