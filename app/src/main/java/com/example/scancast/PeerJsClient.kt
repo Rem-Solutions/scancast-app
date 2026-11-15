@@ -25,15 +25,9 @@ import kotlin.random.Random
 
 /** Configuración. Debe coincidir con la web receptora. */
 object ScanCastConfig {
-    /**
-     * Prefijo del peer ID de la web. El index.html entregado registra "pantalla-<SALA>".
-     * Si tu web desplegada usa otro (por ejemplo "screen-share-"), cámbialo aquí.
-     * Para comprobarlo: abre la web, Ctrl+U y busca `PREFIX`.
-     */
     const val PEER_PREFIX = "pantalla-"
-
-    const val PEER_HOST = "0.peerjs.com"   // servidor público de PeerJS
-    const val PEER_KEY = "peerjs"          // clave por defecto de PeerJS
+    const val PEER_HOST = "0.peerjs.com"
+    const val PEER_KEY = "peerjs"
 
     val iceServers: List<PeerConnection.IceServer> = listOf(
         PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
@@ -56,11 +50,7 @@ private fun randomToken(length: Int): String {
     return buildString { repeat(length) { append(chars[Random.nextInt(chars.length)]) } }
 }
 
-/**
- * Habla el protocolo de PeerJS 1.x (WebSocket + mensajes OFFER/ANSWER/CANDIDATE) para
- * "llamar" al peer `pantalla-<SALA>` de la web y enviarle el VideoTrack de la pantalla.
- */
-class PeerJsSender(
+class PeerJsClient(
     private val factory: PeerConnectionFactory,
     private val videoTrack: VideoTrack,
     room: String,
@@ -71,7 +61,7 @@ class PeerJsSender(
         const val KIND_MEDIA = "media"
         const val KIND_DATA = "data"
         const val MAX_TRIES = 6
-        // Aumentado a 6 Mbps para mejorar drásticamente la nitidez en alta resolución
+        // Bitrate aumentado a 6 Mbps para evitar la imagen borrosa
         const val MAX_BITRATE_BPS = 6_000_000
     }
 
@@ -298,6 +288,47 @@ class PeerJsSender(
 
             if (kind == KIND_MEDIA) {
                 val sender = connection.addTrack(videoTrack, listOf("screen"))
-                tune(sender)
+                if (sender != null) {
+                    tune(sender)
+                }
             } else {
-                dc = connection.createDataChannel(connection
+                dc = connection.createDataChannel(connectionId, DataChannel.Init().apply { ordered = true })
+            }
+
+            connection.createOffer(object : SimpleSdpObserver() {
+                override fun onCreateSuccess(desc: SessionDescription?) {
+                    val offer = desc ?: return
+                    main.post {
+                        if (isClosed) return@post
+                        connection.setLocalDescription(object : SimpleSdpObserver() {
+                            override fun onSetSuccess() {
+                                main.post { if (!isClosed) sendOffer(offer) }
+                            }
+                            override fun onSetFailure(error: String?) {
+                                main.post { if (!isClosed && kind == KIND_MEDIA) lost() }
+                            }
+                        }, offer)
+                    }
+                }
+
+                override fun onCreateFailure(error: String?) {
+                    main.post { if (!isClosed && kind == KIND_MEDIA) lost() }
+                }
+            }, MediaConstraints())
+        }
+
+        private fun tune(sender: RtpSender) {
+            try {
+                val params = sender.parameters
+                for (encoding in params.encodings) {
+                    encoding.maxBitrateBps = MAX_BITRATE_BPS
+                    encoding.maxFramerate = 30
+                }
+                sender.setParameters(params)
+            } catch (_: Exception) {
+            }
+        }
+
+        private fun sendOffer(offer: SessionDescription) {
+            val sdp = JSONObject().put("type", "offer").put("sdp", offer.description)
+            val payload = JSONObject()
