@@ -1,5 +1,6 @@
 package com.example.scancast
 
+import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -10,7 +11,10 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.content.res.Configuration
 import android.hardware.display.DisplayManager
+import android.media.AudioAttributes
+import android.media.AudioPlaybackCaptureConfiguration
 import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -21,22 +25,21 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.IntentCompat
+import org.webrtc.AudioSource
+import org.webrtc.AudioTrack
 import org.webrtc.DefaultVideoDecoderFactory
 import org.webrtc.DefaultVideoEncoderFactory
 import org.webrtc.EglBase
+import org.webrtc.MediaConstraints
 import org.webrtc.PeerConnectionFactory
 import org.webrtc.ScreenCapturerAndroid
 import org.webrtc.SurfaceTextureHelper
 import org.webrtc.VideoSource
 import org.webrtc.VideoTrack
+import org.webrtc.audio.JavaAudioDeviceModule
 import kotlin.math.max
 import kotlin.math.min
 
-/**
- * Servicio en primer plano (foregroundServiceType="mediaProjection").
- * Orden obligatorio en Android 14+: startForeground() ANTES de crear el MediaProjection,
- * y el MediaProjection se crea dentro de ScreenCapturerAndroid.startCapture().
- */
 class ScreenCaptureService : Service() {
 
     companion object {
@@ -48,7 +51,7 @@ class ScreenCaptureService : Service() {
         private const val CHANNEL_ID = "screen_share"
         private const val NOTIFICATION_ID = 1001
 
-        private const val MAX_SIDE = 1280f   // lado largo máximo del video (ahorra datos móviles)
+        private const val MAX_SIDE = 1280f
         private const val FPS = 30
 
         fun start(context: Context, room: String, projectionData: Intent) {
@@ -68,10 +71,14 @@ class ScreenCaptureService : Service() {
 
     private var eglBase: EglBase? = null
     private var factory: PeerConnectionFactory? = null
+    private var audioDeviceModule: JavaAudioDeviceModule? = null
+    private var audioSource: AudioSource? = null
+    private var audioTrack: AudioTrack? = null
     private var videoSource: VideoSource? = null
     private var videoTrack: VideoTrack? = null
     private var surfaceHelper: SurfaceTextureHelper? = null
     private var capturer: ScreenCapturerAndroid? = null
+    private var mediaProjection: MediaProjection? = null
     private var sender: PeerJsSender? = null
     private var finishing = false
 
@@ -114,10 +121,6 @@ class ScreenCaptureService : Service() {
         return START_NOT_STICKY
     }
 
-    // ------------------------------------------------------------------
-    // Sesión
-    // ------------------------------------------------------------------
-
     private fun startSession(room: String, projectionData: Intent) {
         releaseMedia()
         finishing = false
@@ -130,13 +133,39 @@ class ScreenCaptureService : Service() {
             )
             val egl = EglBase.create()
             eglBase = egl
+
+            // 1. Obtener MediaProjection para compartirlo entre video y audio interno
+            val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            val projection = projectionManager.getMediaProjection(Activity.RESULT_OK, projectionData)
+            mediaProjection = projection
+
+            // 2. Configurar módulo de audio interno (Android 10+)
+            val admBuilder = JavaAudioDeviceModule.builder(applicationContext)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && projection != null) {
+                val captureConfig = AudioPlaybackCaptureConfiguration.Builder(projection)
+                    .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                    .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                    .build()
+                admBuilder.setAudioPlaybackCaptureConfiguration(captureConfig)
+            }
+            val adm = admBuilder.createAudioDeviceModule()
+            audioDeviceModule = adm
+
+            // 3. Crear PeerConnectionFactory con soporte de audio y video
             val peerFactory = PeerConnectionFactory.builder()
+                .setAudioDeviceModule(adm)
                 .setVideoEncoderFactory(DefaultVideoEncoderFactory(egl.eglBaseContext, true, true))
                 .setVideoDecoderFactory(DefaultVideoDecoderFactory(egl.eglBaseContext))
                 .createPeerConnectionFactory()
             factory = peerFactory
 
-            // true = es una captura de pantalla (prioriza nitidez sobre fluidez)
+            // 4. Crear Track de Audio
+            val aSource = peerFactory.createAudioSource(MediaConstraints())
+            audioSource = aSource
+            val aTrack = peerFactory.createAudioTrack("audio0", aSource)
+            audioTrack = aTrack
+
+            // 5. Crear Track de Video
             val source = peerFactory.createVideoSource(true)
             videoSource = source
 
@@ -144,7 +173,6 @@ class ScreenCaptureService : Service() {
             surfaceHelper = helper
 
             val screenCapturer = ScreenCapturerAndroid(projectionData, object : MediaProjection.Callback() {
-                // El usuario detuvo la captura desde el sistema (chip/notificación de Android).
                 override fun onStop() {
                     main.post { stopSession() }
                 }
@@ -155,12 +183,14 @@ class ScreenCaptureService : Service() {
             val (w, h) = captureSize()
             screenCapturer.startCapture(w, h, FPS)
 
-            val track = peerFactory.createVideoTrack("screen0", source)
-            videoTrack = track
+            val vTrack = peerFactory.createVideoTrack("screen0", source)
+            videoTrack = vTrack
 
+            // 6. Enviar Video + Audio por PeerJsSender
             val peerSender = PeerJsSender(
                 factory = peerFactory,
-                videoTrack = track,
+                videoTrack = vTrack,
+                audioTrack = aTrack,
                 room = room,
                 onStatus = { status, message ->
                     ShareState.update(status, message)
@@ -196,6 +226,10 @@ class ScreenCaptureService : Service() {
         try { capturer?.stopCapture() } catch (_: Throwable) {}
         try { capturer?.dispose() } catch (_: Throwable) {}
         capturer = null
+        try { audioTrack?.dispose() } catch (_: Throwable) {}
+        audioTrack = null
+        try { audioSource?.dispose() } catch (_: Throwable) {}
+        audioSource = null
         try { videoTrack?.dispose() } catch (_: Throwable) {}
         videoTrack = null
         try { videoSource?.dispose() } catch (_: Throwable) {}
@@ -204,6 +238,10 @@ class ScreenCaptureService : Service() {
         surfaceHelper = null
         try { factory?.dispose() } catch (_: Throwable) {}
         factory = null
+        try { audioDeviceModule?.release() } catch (_: Throwable) {}
+        audioDeviceModule = null
+        try { mediaProjection?.stop() } catch (_: Throwable) {}
+        mediaProjection = null
         try { eglBase?.release() } catch (_: Throwable) {}
         eglBase = null
     }
@@ -214,7 +252,6 @@ class ScreenCaptureService : Service() {
         super.onDestroy()
     }
 
-    // Al girar el teléfono se adapta el tamaño de la captura (la web usa contain/cover).
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         val screenCapturer = capturer ?: return
@@ -225,7 +262,6 @@ class ScreenCaptureService : Service() {
         }
     }
 
-    /** Tamaño real de la pantalla, reducido a MAX_SIDE y con dimensiones pares. */
     private fun captureSize(): Pair<Int, Int> {
         val metrics = DisplayMetrics()
         val display = (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
@@ -238,13 +274,9 @@ class ScreenCaptureService : Service() {
         return width to height
     }
 
-    // ------------------------------------------------------------------
-    // Notificación
-    // ------------------------------------------------------------------
-
     private fun updateNotification(status: ShareStatus) {
         val text = when (status) {
-            ShareStatus.STREAMING -> "Transmitiendo tu pantalla"
+            ShareStatus.STREAMING -> "Transmitiendo pantalla y audio"
             ShareStatus.RECONNECTING -> "Reconectando…"
             else -> "Conectando…"
         }
