@@ -41,22 +41,6 @@ object ScanCastConfig {
         PeerConnection.IceServer.builder("stun:stun2.l.google.com:19302").createIceServer(),
         PeerConnection.IceServer.builder("stun:stun3.l.google.com:19302").createIceServer(),
         PeerConnection.IceServer.builder("stun:stun4.l.google.com:19302").createIceServer(),
-
-        // ---------------------------------------------------------------
-        // SERVIDOR TURN (opcional, para datos móviles <-> red con NAT estricto).
-        // Quita los comentarios y reemplaza TU_SERVIDOR / TU_USUARIO / TU_CLAVE.
-        //
-        // PeerConnection.IceServer.builder(
-        //     listOf(
-        //         "turn:TU_SERVIDOR:3478?transport=udp",
-        //         "turn:TU_SERVIDOR:3478?transport=tcp",
-        //         "turns:TU_SERVIDOR:5349?transport=tcp"
-        //     )
-        // )
-        //     .setUsername("TU_USUARIO")
-        //     .setPassword("TU_CLAVE")
-        //     .createIceServer(),
-        // ---------------------------------------------------------------
     )
 }
 
@@ -75,12 +59,6 @@ private fun randomToken(length: Int): String {
 /**
  * Habla el protocolo de PeerJS 1.x (WebSocket + mensajes OFFER/ANSWER/CANDIDATE) para
  * "llamar" al peer `pantalla-<SALA>` de la web y enviarle el VideoTrack de la pantalla.
- *
- * Abre dos conexiones, igual que lo haría un navegador con PeerJS:
- *  - "media": lleva el video.
- *  - "data":  canal de datos solo para avisar "bye" al detener, así la web vuelve al QR al instante.
- *
- * Todo el estado se toca solo desde el hilo principal.
  */
 class PeerJsSender(
     private val factory: PeerConnectionFactory,
@@ -93,12 +71,13 @@ class PeerJsSender(
         const val KIND_MEDIA = "media"
         const val KIND_DATA = "data"
         const val MAX_TRIES = 6
-        const val MAX_BITRATE_BPS = 4_000_000
+        // Aumentado a 6 Mbps para mejorar drásticamente la nitidez en alta resolución
+        const val MAX_BITRATE_BPS = 6_000_000
     }
 
     private val main = Handler(Looper.getMainLooper())
     private val http = OkHttpClient.Builder()
-        .readTimeout(0, TimeUnit.MILLISECONDS)      // WebSocket: sin timeout de lectura
+        .readTimeout(0, TimeUnit.MILLISECONDS)
         .pingInterval(25, TimeUnit.SECONDS)
         .build()
 
@@ -127,15 +106,10 @@ class PeerJsSender(
         }
     }
 
-    // ------------------------------------------------------------------
-    // API pública
-    // ------------------------------------------------------------------
-
     fun start() {
         connectSocket()
     }
 
-    /** Avisa "bye" a la web, espera un instante y cierra todo. */
     fun stop(onDone: () -> Unit) {
         if (stopping || finished) return
         stopping = true
@@ -158,10 +132,6 @@ class PeerJsSender(
         ws = null
         http.dispatcher.executorService.shutdown()
     }
-
-    // ------------------------------------------------------------------
-    // Señalización (WebSocket)
-    // ------------------------------------------------------------------
 
     private fun connectSocket() {
         if (finished || stopping) return
@@ -191,7 +161,6 @@ class PeerJsSender(
         if (finished || stopping || socket !== ws) return
         socketOpen = false
         main.removeCallbacks(heartbeat)
-        // El video sigue fluyendo por P2P aunque el servidor de señalización se caiga.
         if (!everConnected) onStatus(ShareStatus.CONNECTING, "Conectando…")
         socketRetries++
         main.postDelayed({ connectSocket() }, min(1000L * socketRetries, 8000L))
@@ -218,7 +187,6 @@ class PeerJsSender(
                 fail("Error del servidor de señalización: ${msg.optString("payload")}")
             }
             "EXPIRE" -> {
-                // El servidor no encontró el peer destino.
                 if (msg.optString("src") != target) return
                 if (!everConnected) fail("No se encontró la pantalla receptora. Revisa el código de sala.")
                 else lost()
@@ -250,10 +218,6 @@ class PeerJsSender(
         onFatal(message)
     }
 
-    // ------------------------------------------------------------------
-    // Enlaces WebRTC y reconexión
-    // ------------------------------------------------------------------
-
     private fun findLink(connectionId: String): Link? =
         listOfNotNull(media, data).firstOrNull { it.connectionId == connectionId }
 
@@ -277,7 +241,6 @@ class PeerJsSender(
         retryRunnable = null
     }
 
-    /** Se perdió el enlace: reintenta en segundo plano con espera creciente. */
     private fun lost() {
         if (finished || stopping || retryRunnable != null) return
         onStatus(ShareStatus.RECONNECTING, "Reconectando…")
@@ -289,7 +252,6 @@ class PeerJsSender(
                 return@Runnable
             }
             tries++
-            // Si el socket no está abierto, connectLinks() se ejecutará al recibir OPEN.
             if (socketOpen) connectLinks()
         }
         retryRunnable = runnable
@@ -338,150 +300,4 @@ class PeerJsSender(
                 val sender = connection.addTrack(videoTrack, listOf("screen"))
                 tune(sender)
             } else {
-                dc = connection.createDataChannel(connectionId, DataChannel.Init().apply { ordered = true })
-            }
-
-            connection.createOffer(object : SimpleSdpObserver() {
-                override fun onCreateSuccess(desc: SessionDescription?) {
-                    val offer = desc ?: return
-                    main.post {
-                        if (isClosed) return@post
-                        connection.setLocalDescription(object : SimpleSdpObserver() {
-                            override fun onSetSuccess() {
-                                main.post { if (!isClosed) sendOffer(offer) }
-                            }
-                            override fun onSetFailure(error: String?) {
-                                main.post { if (!isClosed && kind == KIND_MEDIA) lost() }
-                            }
-                        }, offer)
-                    }
-                }
-
-                override fun onCreateFailure(error: String?) {
-                    main.post { if (!isClosed && kind == KIND_MEDIA) lost() }
-                }
-            }, MediaConstraints())
-        }
-
-        private fun tune(sender: RtpSender) {
-            try {
-                val params = sender.parameters
-                for (encoding in params.encodings) {
-                    encoding.maxBitrateBps = MAX_BITRATE_BPS
-                    encoding.maxFramerate = 30
-                }
-                sender.setParameters(params)
-            } catch (_: Exception) {
-            }
-        }
-
-        private fun sendOffer(offer: SessionDescription) {
-            val sdp = JSONObject().put("type", "offer").put("sdp", offer.description)
-            val payload = JSONObject()
-                .put("sdp", sdp)
-                .put("type", kind)
-                .put("connectionId", connectionId)
-                .put("browser", "chrome")
-            if (kind == KIND_DATA) {
-                payload.put("label", connectionId)
-                    .put("reliable", true)
-                    .put("serialization", "raw") // texto plano: la web recibe el string "bye"
-            }
-            send(JSONObject().put("type", "OFFER").put("payload", payload).put("dst", target))
-            offerSent = true
-            pendingLocal.forEach { sendCandidate(it) }
-            pendingLocal.clear()
-        }
-
-        private fun onLocalCandidate(candidate: IceCandidate) {
-            if (isClosed) return
-            if (offerSent) sendCandidate(candidate) else pendingLocal.add(candidate)
-        }
-
-        private fun sendCandidate(candidate: IceCandidate) {
-            val cand = JSONObject()
-                .put("candidate", candidate.sdp)
-                .put("sdpMid", candidate.sdpMid)
-                .put("sdpMLineIndex", candidate.sdpMLineIndex)
-            val payload = JSONObject()
-                .put("candidate", cand)
-                .put("type", kind)
-                .put("connectionId", connectionId)
-            send(JSONObject().put("type", "CANDIDATE").put("payload", payload).put("dst", target))
-        }
-
-        fun onAnswer(sdp: String) {
-            val connection = pc ?: return
-            if (isClosed) return
-            connection.setRemoteDescription(object : SimpleSdpObserver() {
-                override fun onSetSuccess() {
-                    main.post {
-                        if (isClosed) return@post
-                        remoteSet = true
-                        pendingRemote.forEach { connection.addIceCandidate(it) }
-                        pendingRemote.clear()
-                    }
-                }
-                override fun onSetFailure(error: String?) {
-                    main.post { if (!isClosed && kind == KIND_MEDIA) lost() }
-                }
-            }, SessionDescription(SessionDescription.Type.ANSWER, sdp))
-        }
-
-        fun onRemoteCandidate(json: JSONObject) {
-            val line = json.optString("candidate")
-            if (line.isNullOrBlank() || isClosed) return
-            val candidate = IceCandidate(
-                json.optString("sdpMid"),
-                json.optInt("sdpMLineIndex", 0),
-                line
-            )
-            if (remoteSet) pc?.addIceCandidate(candidate) else pendingRemote.add(candidate)
-        }
-
-        private fun onIce(state: PeerConnection.IceConnectionState?) {
-            if (isClosed || kind != KIND_MEDIA || media !== this) return
-            when (state) {
-                PeerConnection.IceConnectionState.CONNECTED,
-                PeerConnection.IceConnectionState.COMPLETED -> {
-                    everConnected = true
-                    tries = 0
-                    cancelRetry()
-                    onStatus(ShareStatus.STREAMING, "")
-                }
-                PeerConnection.IceConnectionState.DISCONNECTED -> {
-                    onStatus(ShareStatus.RECONNECTING, "Conexión inestable…")
-                    main.postDelayed({
-                        if (!isClosed && media === this) {
-                            val current = pc?.iceConnectionState()
-                            if (current == PeerConnection.IceConnectionState.DISCONNECTED ||
-                                current == PeerConnection.IceConnectionState.FAILED
-                            ) lost()
-                        }
-                    }, 5000)
-                }
-                PeerConnection.IceConnectionState.FAILED -> lost()
-                else -> {}
-            }
-        }
-
-        fun sendBye() {
-            val channel = dc ?: return
-            try {
-                if (channel.state() == DataChannel.State.OPEN) {
-                    channel.send(DataChannel.Buffer(ByteBuffer.wrap("bye".toByteArray()), false))
-                }
-            } catch (_: Exception) {
-            }
-        }
-
-        fun close() {
-            if (isClosed) return
-            isClosed = true
-            try { dc?.close(); dc?.dispose() } catch (_: Exception) {}
-            try { pc?.close(); pc?.dispose() } catch (_: Exception) {}
-            dc = null
-            pc = null
-        }
-    }
-}
+                dc = connection.createDataChannel(connection
