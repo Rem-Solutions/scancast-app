@@ -1,6 +1,5 @@
 package com.example.scancast
 
-import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -11,12 +10,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.content.res.Configuration
 import android.hardware.display.DisplayManager
-import android.media.AudioAttributes
-import android.media.AudioFormat
-import android.media.AudioPlaybackCaptureConfiguration
-import android.media.AudioRecord
 import android.media.projection.MediaProjection
-import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -80,7 +74,6 @@ class ScreenCaptureService : Service() {
     private var videoTrack: VideoTrack? = null
     private var surfaceHelper: SurfaceTextureHelper? = null
     private var capturer: ScreenCapturerAndroid? = null
-    private var mediaProjection: MediaProjection? = null
     private var sender: PeerJsSender? = null
     private var finishing = false
 
@@ -136,11 +129,7 @@ class ScreenCaptureService : Service() {
             val egl = EglBase.create()
             eglBase = egl
 
-            val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            val projection = projectionManager.getMediaProjection(Activity.RESULT_OK, projectionData)
-            mediaProjection = projection
-
-            // Inicializar el módulo de audio estándar de WebRTC de forma segura
+            // Módulo de audio estándar para evitar conflictos con el token de proyección
             val adm = JavaAudioDeviceModule.builder(applicationContext)
                 .setUseHardwareAcousticEchoCanceler(false)
                 .setUseHardwareNoiseSuppressor(false)
@@ -154,19 +143,18 @@ class ScreenCaptureService : Service() {
                 .createPeerConnectionFactory()
             factory = peerFactory
 
-            // Crear Track de Audio nativo
             val aSource = peerFactory.createAudioSource(MediaConstraints())
             audioSource = aSource
             val aTrack = peerFactory.createAudioTrack("audio0", aSource)
             audioTrack = aTrack
 
-            // Crear Track de Video optimizado
             val source = peerFactory.createVideoSource(true)
             videoSource = source
 
             val helper = SurfaceTextureHelper.create("ScreenCaptureThread", egl.eglBaseContext)
             surfaceHelper = helper
 
+            // Aquí se consume el projectionData una sola vez de forma correcta
             val screenCapturer = ScreenCapturerAndroid(projectionData, object : MediaProjection.Callback() {
                 override fun onStop() {
                     main.post { stopSession() }
@@ -181,7 +169,6 @@ class ScreenCaptureService : Service() {
             val vTrack = peerFactory.createVideoTrack("screen0", source)
             videoTrack = vTrack
 
-            // Enviamos video y audio al PeerJsSender existente
             val peerSender = PeerJsSender(
                 factory = peerFactory,
                 videoTrack = vTrack,
@@ -235,8 +222,6 @@ class ScreenCaptureService : Service() {
         factory = null
         try { audioDeviceModule?.release() } catch (_: Throwable) {}
         audioDeviceModule = null
-        try { mediaProjection?.stop() } catch (_: Throwable) {}
-        mediaProjection = null
         try { eglBase?.release() } catch (_: Throwable) {}
         eglBase = null
     }
@@ -271,7 +256,7 @@ class ScreenCaptureService : Service() {
 
     private fun updateNotification(status: ShareStatus) {
         val text = when (status) {
-            ShareStatus.STREAMING -> "Transmitiendo pantalla y audio"
+            ShareStatus.STREAMING -> "Transmitiendo tu pantalla"
             ShareStatus.RECONNECTING -> "Reconectando…"
             else -> "Conectando…"
         }
