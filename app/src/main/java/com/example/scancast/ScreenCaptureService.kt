@@ -12,7 +12,9 @@ import android.content.pm.ServiceInfo
 import android.content.res.Configuration
 import android.hardware.display.DisplayManager
 import android.media.AudioAttributes
+import android.media.AudioFormat
 import android.media.AudioPlaybackCaptureConfiguration
+import android.media.AudioRecord
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
@@ -134,24 +136,35 @@ class ScreenCaptureService : Service() {
             val egl = EglBase.create()
             eglBase = egl
 
-            // 1. Obtener MediaProjection para compartirlo entre video y audio interno
             val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             val projection = projectionManager.getMediaProjection(Activity.RESULT_OK, projectionData)
             mediaProjection = projection
 
-            // 2. Configurar módulo de audio interno (Android 10+)
+            // Configurar módulo de audio interno mediante la factoría de WebRTC (API 29+)
             val admBuilder = JavaAudioDeviceModule.builder(applicationContext)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && projection != null) {
-                val captureConfig = AudioPlaybackCaptureConfiguration.Builder(projection)
-                    .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-                    .addMatchingUsage(AudioAttributes.USAGE_GAME)
-                    .build()
-                admBuilder.setAudioPlaybackCaptureConfiguration(captureConfig)
+                admBuilder.setAudioRecordFactory { _ ->
+                    val audioFormat = AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(44100)
+                        .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+                        .build()
+
+                    val captureConfig = AudioPlaybackCaptureConfiguration.Builder(projection)
+                        .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                        .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                        .build()
+
+                    AudioRecord.Builder()
+                        .setAudioPlaybackCaptureConfig(captureConfig)
+                        .setAudioFormat(audioFormat)
+                        .setBufferSizeInBytes(AudioRecord.getMinBufferSize(44100, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT) * 2)
+                        .build()
+                }
             }
             val adm = admBuilder.createAudioDeviceModule()
             audioDeviceModule = adm
 
-            // 3. Crear PeerConnectionFactory con soporte de audio y video
             val peerFactory = PeerConnectionFactory.builder()
                 .setAudioDeviceModule(adm)
                 .setVideoEncoderFactory(DefaultVideoEncoderFactory(egl.eglBaseContext, true, true))
@@ -159,13 +172,11 @@ class ScreenCaptureService : Service() {
                 .createPeerConnectionFactory()
             factory = peerFactory
 
-            // 4. Crear Track de Audio
             val aSource = peerFactory.createAudioSource(MediaConstraints())
             audioSource = aSource
             val aTrack = peerFactory.createAudioTrack("audio0", aSource)
             audioTrack = aTrack
 
-            // 5. Crear Track de Video
             val source = peerFactory.createVideoSource(true)
             videoSource = source
 
@@ -186,7 +197,6 @@ class ScreenCaptureService : Service() {
             val vTrack = peerFactory.createVideoTrack("screen0", source)
             videoTrack = vTrack
 
-            // 6. Enviar Video + Audio por PeerJsSender
             val peerSender = PeerJsSender(
                 factory = peerFactory,
                 videoTrack = vTrack,
