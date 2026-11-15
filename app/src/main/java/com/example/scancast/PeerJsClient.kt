@@ -8,6 +8,7 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONObject
+import org.webrtc.AudioTrack
 import org.webrtc.DataChannel
 import org.webrtc.IceCandidate
 import org.webrtc.MediaConstraints
@@ -53,6 +54,7 @@ private fun randomToken(length: Int): String {
 class PeerJsSender(
     private val factory: PeerConnectionFactory,
     private val videoTrack: VideoTrack,
+    private val audioTrack: AudioTrack?, // <-- NUEVO: Recibe el audio interno
     room: String,
     private val onStatus: (ShareStatus, String) -> Unit,
     private val onFatal: (String) -> Unit
@@ -289,6 +291,10 @@ class PeerJsSender(
                 val sender = connection.addTrack(videoTrack, listOf("screen"))
                 if (sender != null) {
                     tune(sender)
+                }
+                // NUEVO: Agregamos también el track de audio interno a la transmisión
+                if (audioTrack != null) {
+                    connection.addTrack(audioTrack, listOf("screen"))
                 }
             } else {
                 dc = connection.createDataChannel(connectionId, DataChannel.Init().apply { ordered = true })
