@@ -4,6 +4,9 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.CAMERA" />
+    
+    <!-- NUEVO: Requerido para capturar el audio interno del sistema (AudioPlaybackCapture) -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <!-- Servicio en primer plano (Android 9+) y su tipo específico (Android 14+) -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
