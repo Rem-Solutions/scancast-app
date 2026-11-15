@@ -20,12 +20,13 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Create local.properties
-        run: echo "sdk.dir=$ANDROID_HOME" > local.properties
-
-      - name: Build Debug APK using Gradle directly
+      - name: Initialize Gradle Wrapper and Build
         run: |
-          gradle assembleDebug --no-daemon -b app/build.gradle.kts || gradle assembleDebug --no-daemon
+          if [ ! -f "./gradlew" ]; then
+            gradle wrapper --gradle-version 8.5
+          fi
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
 
       - name: Upload generated APK
         uses: actions/upload-artifact@v4
