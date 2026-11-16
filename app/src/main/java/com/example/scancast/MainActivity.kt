@@ -3,6 +3,7 @@ package com.example.scancast
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
@@ -175,118 +176,4 @@ class MainActivity : AppCompatActivity() {
         stopButton.visibility = if (active) View.VISIBLE else View.GONE
         scanButton.isEnabled = !active
         connectButton.isEnabled = !active
-        roomInput.isEnabled = !active
-    }
-
-    private fun toast(text: String) = Toast.makeText(this, text, Toast.LENGTH_LONG).show()
-
-    // ---- Código de sala --------------------------------------------------------
-
-    private fun extractRoom(raw: String?, allowRaw: Boolean): String? {
-        val text = raw?.trim().orEmpty()
-        if (text.isEmpty()) return null
-        if (text.startsWith("http://", ignoreCase = true) || text.startsWith("https://", ignoreCase = true)) {
-            val room = Uri.parse(text).getQueryParameter("room")?.trim()
-            return if (room != null && roomPattern.matches(room)) room else null
-        }
-        return if (allowRaw && roomPattern.matches(text)) text.uppercase() else null
-    }
-
-    private fun connectWithTypedCode() {
-        val room = extractRoom(roomInput.text?.toString(), allowRaw = true)
-        if (room == null) {
-            toast("Escribe un código de sala válido (por ejemplo ABC123) o pega el enlace completo.")
-            return
-        }
-        (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager)
-            .hideSoftInputFromWindow(roomInput.windowToken, 0)
-        beginShare(room)
-    }
-
-    /** Pide primero permiso de audio (para el sonido interno) y luego proyección de pantalla. */
-    private fun beginShare(room: String) {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
-            pendingAudioRoom = room
-            audioPermission.launch(Manifest.permission.RECORD_AUDIO)
-        } else {
-            launchProjectionIntent(room)
-        }
-    }
-
-    private fun launchProjectionIntent(room: String) {
-        pendingRoom = room
-        val manager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        projectionLauncher.launch(manager.createScreenCaptureIntent())
-    }
-
-    // ---- Escáner QR (CameraX + ML Kit) -----------------------------------------
-
-    private fun openScanner() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-            == PackageManager.PERMISSION_GRANTED
-        ) startScanner() else cameraPermission.launch(Manifest.permission.CAMERA)
-    }
-
-    @androidx.annotation.OptIn(ExperimentalGetImage::class)
-    private fun startScanner() {
-        scanHandled = false
-        scannerOverlay.visibility = View.VISIBLE
-        backCallback.isEnabled = true
-
-        val providerFuture = ProcessCameraProvider.getInstance(this)
-        providerFuture.addListener({
-            val provider = providerFuture.get()
-            cameraProvider = provider
-
-            val preview = Preview.Builder().build().also {
-                it.setSurfaceProvider(previewView.surfaceProvider)
-            }
-            val client = BarcodeScanning.getClient(
-                BarcodeScannerOptions.Builder().setBarcodeFormats(Barcode.FORMAT_QR_CODE).build()
-            )
-            scanner = client
-
-            val analysis = ImageAnalysis.Builder()
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .build()
-            analysis.setAnalyzer(cameraExecutor) { proxy ->
-                val mediaImage = proxy.image
-                if (mediaImage == null || scanHandled) {
-                    proxy.close()
-                    return@setAnalyzer
-                }
-                val image = InputImage.fromMediaImage(mediaImage, proxy.imageInfo.rotationDegrees)
-                client.process(image)
-                    .addOnSuccessListener { codes ->
-                        val room = codes.firstNotNullOfOrNull { extractRoom(it.rawValue, allowRaw = false) }
-                        if (room != null && !scanHandled) {
-                            scanHandled = true
-                            runOnUiThread {
-                                stopScanner()
-                                beginShare(room)
-                            }
-                        }
-                    }
-                    .addOnCompleteListener { proxy.close() }
-            }
-
-            try {
-                provider.unbindAll()
-                provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
-            } catch (e: Exception) {
-                toast("No se pudo abrir la cámara.")
-                stopScanner()
-            }
-        }, ContextCompat.getMainExecutor(this))
-    }
-
-    private fun stopScanner() {
-        backCallback.isEnabled = false
-        scannerOverlay.visibility = View.GONE
-        cameraProvider?.unbindAll()
-        scanner?.close()
-        scanner = null
-    }
-}
+        roomInput.
