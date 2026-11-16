@@ -70,6 +70,8 @@ class ScreenCaptureService : Service() {
     private var finishing = false
     private var previousVolume = -1
     private var isPhoneMuted = false
+    private var lastW = 0
+    private var lastH = 0
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -121,17 +123,25 @@ class ScreenCaptureService : Service() {
                 if (!isPhoneMuted) {
                     previousVolume = am.getStreamVolume(AudioManager.STREAM_MUSIC)
                 }
-                // Dejamos en nivel 1 (casi inaudible en el altavoz) para que Android NO corte
-                // la señal interna de AudioPlaybackCapture, y compensamos con ganancia digital.
-                am.setStreamVolume(AudioManager.STREAM_MUSIC, 1, 0)
-                customAdm?.gainMultiplier = 6.0f
+                // Silenciar completamente la salida física del teléfono
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0)
+                }
+                am.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
+                customAdm?.gainMultiplier = 4.5f
                 isPhoneMuted = true
             } else {
-                if (previousVolume != -1) {
-                    am.setStreamVolume(AudioManager.STREAM_MUSIC, previousVolume, 0)
-                    previousVolume = -1
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
                 }
-                customAdm?.gainMultiplier = 2.5f
+                if (previousVolume > 0) {
+                    am.setStreamVolume(AudioManager.STREAM_MUSIC, previousVolume, 0)
+                } else {
+                    val maxVol = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                    am.setStreamVolume(AudioManager.STREAM_MUSIC, maxVol / 2, 0)
+                }
+                previousVolume = -1
+                customAdm?.gainMultiplier = 2.0f
                 isPhoneMuted = false
             }
         } catch (_: Throwable) {}
@@ -171,7 +181,7 @@ class ScreenCaptureService : Service() {
             }
             val aSource = peerFactory.createAudioSource(audioConstraints).also { audioSource = it }
             val aTrack = peerFactory.createAudioTrack("audio0", aSource).apply {
-                setVolume(4.0) // Refuerzo extra en el track WebRTC
+                setVolume(3.5)
             }.also { audioTrack = it }
 
             val source = peerFactory.createVideoSource(true).also { videoSource = it }
@@ -179,6 +189,8 @@ class ScreenCaptureService : Service() {
             screenCapturer.initialize(helper, applicationContext, source.capturerObserver)
 
             val (w, h) = captureSize()
+            lastW = w
+            lastH = h
             screenCapturer.startCapture(w, h, FPS)
             val vTrack = peerFactory.createVideoTrack("screen0", source).also { videoTrack = it }
 
@@ -218,13 +230,21 @@ class ScreenCaptureService : Service() {
     }
 
     private fun releaseMedia() {
-        if (isPhoneMuted && previousVolume != -1) {
+        if (isPhoneMuted) {
             try {
-                (getSystemService(Context.AUDIO_SERVICE) as AudioManager).setStreamVolume(AudioManager.STREAM_MUSIC, previousVolume, 0)
+                val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
+                }
+                if (previousVolume != -1) {
+                    am.setStreamVolume(AudioManager.STREAM_MUSIC, previousVolume, 0)
+                }
             } catch (_: Throwable) {}
         }
         previousVolume = -1
         isPhoneMuted = false
+        lastW = 0
+        lastH = 0
 
         try { sender?.shutdownNow() } catch (_: Throwable) {}; sender = null
         try { capturer?.stopCapture() } catch (_: Throwable) {}
@@ -247,10 +267,17 @@ class ScreenCaptureService : Service() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        try {
-            val (w, h) = captureSize()
-            capturer?.changeCaptureFormat(w, h, FPS)
-        } catch (_: Throwable) {}
+        // Esperar 150ms a que la pantalla termine de rotar (ej. YouTube en pantalla completa)
+        main.postDelayed({
+            try {
+                val (w, h) = captureSize()
+                if (w > 0 && h > 0 && (w != lastW || h != lastH)) {
+                    lastW = w
+                    lastH = h
+                    capturer?.changeCaptureFormat(w, h, FPS)
+                }
+            } catch (_: Throwable) {}
+        }, 150)
     }
 
     private fun captureSize(): Pair<Int, Int> {
@@ -258,7 +285,10 @@ class ScreenCaptureService : Service() {
         @Suppress("DEPRECATION")
         (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager).getDisplay(Display.DEFAULT_DISPLAY).getRealMetrics(metrics)
         val scale = min(1f, MAX_SIDE / max(metrics.widthPixels, metrics.heightPixels).toFloat())
-        return ((metrics.widthPixels * scale).toInt() and 1.inv()) to ((metrics.heightPixels * scale).toInt() and 1.inv())
+        // Múltiplos de 16 para evitar fallos del encoder hardware al girar a pantalla completa
+        val w = max(16, (metrics.widthPixels * scale).toInt() and 15.inv())
+        val h = max(16, (metrics.heightPixels * scale).toInt() and 15.inv())
+        return w to h
     }
 
     private fun updateNotification(status: ShareStatus) {
@@ -364,7 +394,25 @@ private class InternalAudioDeviceModule(
 
                 record.startRecording()
 
+                // Apagar el micrófono físico que WebRTC abre por defecto para eliminar eco y pitidos
+                var micKilled = false
+                val micField: Field? = try {
+                    webRtcRecord.javaClass.getDeclaredField("audioRecord").apply { isAccessible = true }
+                } catch (_: Throwable) { null }
+
                 while (recording) {
+                    if (!micKilled && micField != null) {
+                        try {
+                            val physicalMic = micField.get(webRtcRecord) as? AudioRecord
+                            if (physicalMic != null) {
+                                try { physicalMic.stop() } catch (_: Throwable) {}
+                                try { physicalMic.release() } catch (_: Throwable) {}
+                                micField.set(webRtcRecord, null)
+                                micKilled = true
+                            }
+                        } catch (_: Throwable) {}
+                    }
+
                     val directBuffer = byteBufferField.get(webRtcRecord) as? ByteBuffer
                     val nativeRecPtr = nativePtrField.getLong(webRtcRecord)
                     if (directBuffer != null && nativeRecPtr != 0L) {
