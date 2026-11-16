@@ -212,7 +212,6 @@ class ScreenCaptureService : Service() {
         }
     }
 
-    /** Extrae el MediaProjection ya inicializado dentro de ScreenCapturerAndroid sin reutilizar resultData. */
     private fun extractMediaProjection(screenCapturer: ScreenCapturerAndroid): MediaProjection? {
         return try {
             val field = ScreenCapturerAndroid::class.java.getDeclaredField("mediaProjection")
@@ -310,4 +309,123 @@ class ScreenCaptureService : Service() {
     private fun buildNotification(text: String): Notification {
         val stopIntent = PendingIntent.getService(
             this, 1,
-            Intent(this, ScreenCaptureService::class
+            Intent(this, ScreenCaptureService::class.java).setAction(ACTION_STOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val openIntent = PendingIntent.getActivity(
+            this, 0,
+            Intent(this, MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+            PendingIntent.FLAG_IMMUTABLE
+        )
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_menu_share)
+            .setContentTitle("ScanCast")
+            .setContentText(text)
+            .setOngoing(true)
+            .setContentIntent(openIntent)
+            .addAction(0, "Detener", stopIntent)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+            .build()
+    }
+}
+
+private class InternalAudioDeviceModule(
+    context: Context,
+    private val projectionProvider: () -> MediaProjection?
+) : AudioDeviceModule {
+
+    private val delegate = JavaAudioDeviceModule.builder(context)
+        .setUseHardwareAcousticEchoCanceler(false)
+        .setUseHardwareNoiseSuppressor(false)
+        .createAudioDeviceModule()
+
+    @Volatile private var recording = false
+    private var audioRecord: AudioRecord? = null
+
+    init {
+        startInternalCapture()
+    }
+
+    override fun getNativeAudioDeviceModulePointer(): Long =
+        delegate.nativeAudioDeviceModulePointer
+
+    override fun release() {
+        recording = false
+        try { audioRecord?.stop() } catch (_: Throwable) {}
+        try { audioRecord?.release() } catch (_: Throwable) {}
+        audioRecord = null
+        delegate.release()
+    }
+
+    override fun setSpeakerMute(mute: Boolean) = delegate.setSpeakerMute(mute)
+    override fun setMicrophoneMute(mute: Boolean) = delegate.setMicrophoneMute(mute)
+
+    @SuppressLint("MissingPermission")
+    private fun startInternalCapture() {
+        if (recording || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        recording = true
+        thread(start = true, name = "InternalAudioBridge") {
+            var projection: MediaProjection? = null
+            for (i in 0 until 30) {
+                projection = projectionProvider()
+                if (projection != null) break
+                Thread.sleep(100)
+            }
+            if (projection == null) {
+                recording = false
+                return@thread
+            }
+
+            try {
+                val recordField = delegate.javaClass.getDeclaredField("audioInput").apply { isAccessible = true }
+                val webRtcRecord = recordField.get(delegate)
+                val byteBufferField = webRtcRecord.javaClass.getDeclaredField("byteBuffer").apply { isAccessible = true }
+                val nativeDataMethod = webRtcRecord.javaClass.getDeclaredMethod(
+                    "nativeDataIsRecorded",
+                    Int::class.javaPrimitiveType,
+                    Long::class.javaPrimitiveType
+                ).apply { isAccessible = true }
+                val nativePtrField = webRtcRecord.javaClass.getDeclaredField("nativeAudioRecord").apply { isAccessible = true }
+
+                val sampleRate = 48000
+                val config = AudioPlaybackCaptureConfiguration.Builder(projection)
+                    .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                    .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                    .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                    .build()
+
+                val format = AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(sampleRate)
+                    .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                    .build()
+
+                val minBuf = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+                val record = AudioRecord.Builder()
+                    .setAudioPlaybackCaptureConfig(config)
+                    .setAudioFormat(format)
+                    .setBufferSizeInBytes(max(minBuf, 4096))
+                    .build()
+
+                audioRecord = record
+                record.startRecording()
+
+                while (recording) {
+                    val directBuffer = byteBufferField.get(webRtcRecord) as? ByteBuffer
+                    val nativeRecPtr = nativePtrField.getLong(webRtcRecord)
+                    if (directBuffer != null && nativeRecPtr != 0L) {
+                        directBuffer.clear()
+                        val read = record.read(directBuffer, directBuffer.capacity())
+                        if (read > 0) {
+                            nativeDataMethod.invoke(webRtcRecord, read, nativeRecPtr)
+                        }
+                    } else {
+                        Thread.sleep(20)
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+        }
+    }
+}
