@@ -123,12 +123,11 @@ class ScreenCaptureService : Service() {
                 if (!isPhoneMuted) {
                     previousVolume = am.getStreamVolume(AudioManager.STREAM_MUSIC)
                 }
-                // Silenciar completamente la salida física del teléfono
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                     am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0)
                 }
                 am.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
-                customAdm?.gainMultiplier = 4.5f
+                customAdm?.gainMultiplier = 4.0f
                 isPhoneMuted = true
             } else {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -141,7 +140,7 @@ class ScreenCaptureService : Service() {
                     am.setStreamVolume(AudioManager.STREAM_MUSIC, maxVol / 2, 0)
                 }
                 previousVolume = -1
-                customAdm?.gainMultiplier = 2.0f
+                customAdm?.gainMultiplier = 1.8f
                 isPhoneMuted = false
             }
         } catch (_: Throwable) {}
@@ -181,7 +180,7 @@ class ScreenCaptureService : Service() {
             }
             val aSource = peerFactory.createAudioSource(audioConstraints).also { audioSource = it }
             val aTrack = peerFactory.createAudioTrack("audio0", aSource).apply {
-                setVolume(3.5)
+                setVolume(3.0)
             }.also { audioTrack = it }
 
             val source = peerFactory.createVideoSource(true).also { videoSource = it }
@@ -210,9 +209,18 @@ class ScreenCaptureService : Service() {
         }
     }
 
-    private fun extractMediaProjection(sc: ScreenCapturerAndroid): MediaProjection? = try {
-        ScreenCapturerAndroid::class.java.getDeclaredField("mediaProjection").apply { isAccessible = true }.get(sc) as? MediaProjection
-    } catch (_: Throwable) { null }
+    private fun extractMediaProjection(sc: ScreenCapturerAndroid): MediaProjection? {
+        for (field in ScreenCapturerAndroid::class.java.declaredFields) {
+            if (MediaProjection::class.java.isAssignableFrom(field.type)) {
+                try {
+                    field.isAccessible = true
+                    val proj = field.get(sc) as? MediaProjection
+                    if (proj != null) return proj
+                } catch (_: Throwable) {}
+            }
+        }
+        return null
+    }
 
     private fun stopSession(error: String? = null) {
         if (finishing) return
@@ -267,7 +275,6 @@ class ScreenCaptureService : Service() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        // Esperar 150ms a que la pantalla termine de rotar (ej. YouTube en pantalla completa)
         main.postDelayed({
             try {
                 val (w, h) = captureSize()
@@ -285,7 +292,6 @@ class ScreenCaptureService : Service() {
         @Suppress("DEPRECATION")
         (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager).getDisplay(Display.DEFAULT_DISPLAY).getRealMetrics(metrics)
         val scale = min(1f, MAX_SIDE / max(metrics.widthPixels, metrics.heightPixels).toFloat())
-        // Múltiplos de 16 para evitar fallos del encoder hardware al girar a pantalla completa
         val w = max(16, (metrics.widthPixels * scale).toInt() and 15.inv())
         val h = max(16, (metrics.heightPixels * scale).toInt() and 15.inv())
         return w to h
@@ -335,7 +341,7 @@ private class InternalAudioDeviceModule(
 
     @Volatile var gainMultiplier: Float = 3.5f
     @Volatile private var recording = false
-    private var audioRecord: AudioRecord? = null
+    private var internalRecord: AudioRecord? = null
 
     init { startInternalCapture() }
 
@@ -343,9 +349,9 @@ private class InternalAudioDeviceModule(
 
     override fun release() {
         recording = false
-        try { audioRecord?.stop() } catch (_: Throwable) {}
-        try { audioRecord?.release() } catch (_: Throwable) {}
-        audioRecord = null
+        try { internalRecord?.stop() } catch (_: Throwable) {}
+        try { internalRecord?.release() } catch (_: Throwable) {}
+        internalRecord = null
         delegate.release()
     }
 
@@ -358,7 +364,7 @@ private class InternalAudioDeviceModule(
         recording = true
         thread(start = true, name = "InternalAudioBridge") {
             var projection: MediaProjection? = null
-            for (i in 0 until 30) {
+            for (i in 0 until 40) {
                 projection = projectionProvider()
                 if (projection != null) break
                 Thread.sleep(100)
@@ -366,11 +372,36 @@ private class InternalAudioDeviceModule(
             if (projection == null) { recording = false; return@thread }
 
             try {
-                val recordField: Field = delegate.javaClass.getDeclaredField("audioInput").apply { isAccessible = true }
-                val webRtcRecord: Any = recordField.get(delegate) ?: return@thread
-                val byteBufferField: Field = webRtcRecord.javaClass.getDeclaredField("byteBuffer").apply { isAccessible = true }
-                val nativeDataMethod: Method = webRtcRecord.javaClass.getDeclaredMethod("nativeDataIsRecorded", Int::class.javaPrimitiveType, Long::class.javaPrimitiveType).apply { isAccessible = true }
-                val nativePtrField: Field = webRtcRecord.javaClass.getDeclaredField("nativeAudioRecord").apply { isAccessible = true }
+                // Localizar WebRtcAudioRecord dentro de JavaAudioDeviceModule buscando por tipo de campo
+                val webRtcRecord: Any = delegate.javaClass.declaredFields
+                    .firstNotNullOfOrNull { f ->
+                        f.isAccessible = true
+                        val value = f.get(delegate)
+                        if (value != null && value.javaClass.name.contains("AudioRecord")) value else null
+                    } ?: return@thread
+
+                val byteBufferField: Field = webRtcRecord.javaClass.declaredFields
+                    .first { ByteBuffer::class.java.isAssignableFrom(it.type) }
+                    .apply { isAccessible = true }
+
+                val nativeDataMethod: Method = webRtcRecord.javaClass.declaredMethods
+                    .first { m ->
+                        m.parameterTypes.size == 2 &&
+                            m.parameterTypes[0] == Int::class.javaPrimitiveType &&
+                            m.parameterTypes[1] == Long::class.javaPrimitiveType
+                    }.apply { isAccessible = true }
+
+                val nativePtrField: Field = webRtcRecord.javaClass.declaredFields
+                    .first { it.type == Long::class.javaPrimitiveType }
+                    .apply { isAccessible = true }
+
+                val micRecordField: Field? = webRtcRecord.javaClass.declaredFields
+                    .firstOrNull { AudioRecord::class.java.isAssignableFrom(it.type) }
+                    ?.apply { isAccessible = true }
+
+                val micThreadField: Field? = webRtcRecord.javaClass.declaredFields
+                    .firstOrNull { Thread::class.java.isAssignableFrom(it.type) }
+                    ?.apply { isAccessible = true }
 
                 val sampleRate = 48000
                 val config = AudioPlaybackCaptureConfiguration.Builder(projection)
@@ -390,28 +421,28 @@ private class InternalAudioDeviceModule(
                     .setAudioPlaybackCaptureConfig(config)
                     .setAudioFormat(format)
                     .setBufferSizeInBytes(max(minBuf, 4096))
-                    .build().also { audioRecord = it }
+                    .build().also { internalRecord = it }
 
                 record.startRecording()
 
-                // Apagar el micrófono físico que WebRTC abre por defecto para eliminar eco y pitidos
-                var micKilled = false
-                val micField: Field? = try {
-                    webRtcRecord.javaClass.getDeclaredField("audioRecord").apply { isAccessible = true }
-                } catch (_: Throwable) { null }
-
                 while (recording) {
-                    if (!micKilled && micField != null) {
-                        try {
-                            val physicalMic = micField.get(webRtcRecord) as? AudioRecord
-                            if (physicalMic != null) {
-                                try { physicalMic.stop() } catch (_: Throwable) {}
-                                try { physicalMic.release() } catch (_: Throwable) {}
-                                micField.set(webRtcRecord, null)
-                                micKilled = true
-                            }
-                        } catch (_: Throwable) {}
-                    }
+                    // Detener el hilo del micrófono físico de WebRTC y liberar su AudioRecord para que no capte sonido externo
+                    try {
+                        val micThread = micThreadField?.get(webRtcRecord) as? Thread
+                        if (micThread != null && micThread.isAlive) {
+                            val keepAliveField = micThread.javaClass.declaredFields
+                                .firstOrNull { it.type == Boolean::class.javaPrimitiveType }
+                            keepAliveField?.isAccessible = true
+                            keepAliveField?.setBoolean(micThread, false)
+                            micThread.interrupt()
+                        }
+                        val physicalMic = micRecordField?.get(webRtcRecord) as? AudioRecord
+                        if (physicalMic != null) {
+                            try { physicalMic.stop() } catch (_: Throwable) {}
+                            try { physicalMic.release() } catch (_: Throwable) {}
+                            micRecordField?.set(webRtcRecord, null)
+                        }
+                    } catch (_: Throwable) {}
 
                     val directBuffer = byteBufferField.get(webRtcRecord) as? ByteBuffer
                     val nativeRecPtr = nativePtrField.getLong(webRtcRecord)
