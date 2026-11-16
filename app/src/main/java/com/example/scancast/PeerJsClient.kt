@@ -15,7 +15,6 @@ import org.webrtc.MediaConstraints
 import org.webrtc.MediaStream
 import org.webrtc.PeerConnection
 import org.webrtc.PeerConnectionFactory
-import org.webrtc.RtpParameters
 import org.webrtc.RtpSender
 import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
@@ -290,12 +289,10 @@ class PeerJsSender(
             pc = connection
 
             if (kind == KIND_MEDIA) {
-                // Añadir video con stream ID "screen"
                 val videoSender = connection.addTrack(videoTrack, listOf("screen"))
                 if (videoSender != null) {
                     tuneVideo(videoSender)
                 }
-                // Añadir audio interno con el mismo stream ID para que la PC los agrupe
                 if (audioTrack != null) {
                     val audioSender = connection.addTrack(audioTrack, listOf("screen"))
                     if (audioSender != null) {
@@ -311,7 +308,6 @@ class PeerJsSender(
                     val offer = desc ?: return
                     main.post {
                         if (isClosed) return@post
-                        // Modificar el SDP para forzar alta calidad de audio estéreo y sin compresión de voz
                         val modifiedSdp = if (kind == KIND_MEDIA) optimizeSdpForMedia(offer.description) else offer.description
                         val finalOffer = SessionDescription(offer.type, modifiedSdp)
 
@@ -330,7 +326,6 @@ class PeerJsSender(
                     main.post { if (!isClosed && kind == KIND_MEDIA) lost() }
                 }
             }, MediaConstraints().apply {
-                // Forzar negociación multimedia limpia
                 mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "false"))
                 mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", "false"))
             })
@@ -342,7 +337,6 @@ class PeerJsSender(
                 for (encoding in params.encodings) {
                     encoding.maxBitrateBps = MAX_VIDEO_BITRATE_BPS
                     encoding.maxFramerate = 30
-                    encoding.networkPriority = RtpParameters.Priority.HIGH
                 }
                 sender.setParameters(params)
             } catch (_: Exception) {
@@ -354,14 +348,12 @@ class PeerJsSender(
                 val params = sender.parameters
                 for (encoding in params.encodings) {
                     encoding.maxBitrateBps = MAX_AUDIO_BITRATE_BPS
-                    encoding.networkPriority = RtpParameters.Priority.HIGH
                 }
                 sender.setParameters(params)
             } catch (_: Exception) {
             }
         }
 
-        /** Inyecta parámetros en el SDP para habilitar audio estéreo de alta fidelidad (para música/YouTube) */
         private fun optimizeSdpForMedia(sdp: String): String {
             return sdp.replace("useinbandfec=1", "useinbandfec=1; stereo=1; maxaveragebitrate=128000")
         }
