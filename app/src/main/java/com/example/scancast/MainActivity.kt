@@ -3,11 +3,13 @@ package com.example.scancast
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.media.AudioManager
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.view.View
+import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.FrameLayout
@@ -24,6 +26,7 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import com.google.android.material.button.MaterialButton
+import com.google.android.material.switchmaterial.SwitchMaterial
 import com.google.android.material.textfield.TextInputEditText
 import com.google.mlkit.vision.barcode.BarcodeScanner
 import com.google.mlkit.vision.barcode.BarcodeScannerOptions
@@ -41,8 +44,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var roomInput: TextInputEditText
     private lateinit var scannerOverlay: FrameLayout
     private lateinit var previewView: PreviewView
+    private lateinit var mutePhoneSwitch: SwitchMaterial
 
     private var pendingRoom: String? = null
+    private var pendingAudioRoom: String? = null
     private var cameraProvider: ProcessCameraProvider? = null
     private var scanner: BarcodeScanner? = null
     private val cameraExecutor = Executors.newSingleThreadExecutor()
@@ -57,6 +62,13 @@ class MainActivity : AppCompatActivity() {
             if (granted) startScanner() else toast("Se necesita la cámara para escanear el QR.")
         }
 
+    private val audioPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { _ ->
+            val room = pendingAudioRoom
+            pendingAudioRoom = null
+            if (room != null) launchProjectionIntent(room)
+        }
+
     private val notificationPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* opcional */ }
 
@@ -66,7 +78,7 @@ class MainActivity : AppCompatActivity() {
             pendingRoom = null
             val data = result.data
             if (result.resultCode == RESULT_OK && data != null && room != null) {
-                ScreenCaptureService.start(this, room, data)
+                ScreenCaptureService.start(this, room, data, mutePhoneSwitch.isChecked)
             } else {
                 toast("Se canceló el permiso de captura de pantalla.")
             }
@@ -89,6 +101,28 @@ class MainActivity : AppCompatActivity() {
         roomInput = findViewById(R.id.roomInput)
         scannerOverlay = findViewById(R.id.scannerOverlay)
         previewView = findViewById(R.id.previewView)
+
+        // Creamos el interruptor de "Silenciar celular" dinámicamente debajo de stopButton
+        mutePhoneSwitch = SwitchMaterial(this).apply {
+            text = "Silenciar altavoz del celular al transmitir"
+            isChecked = true
+            setPadding(0, 24, 0, 24)
+            setOnCheckedChangeListener { _, isChecked ->
+                if (ShareState.status == ShareStatus.STREAMING || ShareState.status == ShareStatus.CONNECTING) {
+                    val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                    if (isChecked) {
+                        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
+                    } else {
+                        val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, maxVol / 2, 0)
+                    }
+                }
+            }
+        }
+        (stopButton.parent as? ViewGroup)?.let { parent ->
+            val index = parent.indexOfChild(stopButton)
+            parent.addView(mutePhoneSwitch, index + 1)
+        }
 
         onBackPressedDispatcher.addCallback(this, backCallback)
 
@@ -136,7 +170,7 @@ class MainActivity : AppCompatActivity() {
         statusText.text = when (status) {
             ShareStatus.IDLE -> "Escanea el QR de la pantalla receptora."
             ShareStatus.CONNECTING -> "Conectando…"
-            ShareStatus.STREAMING -> "Transmitiendo tu pantalla"
+            ShareStatus.STREAMING -> "Transmitiendo pantalla y audio"
             ShareStatus.RECONNECTING -> "Reconectando…"
             ShareStatus.ERROR -> ShareState.message.ifBlank { "Ocurrió un error." }
         }
@@ -153,7 +187,6 @@ class MainActivity : AppCompatActivity() {
 
     // ---- Código de sala --------------------------------------------------------
 
-    /** Acepta una URL con ?room=XXXXXX o, si [allowRaw], el código suelto. */
     private fun extractRoom(raw: String?, allowRaw: Boolean): String? {
         val text = raw?.trim().orEmpty()
         if (text.isEmpty()) return null
@@ -175,8 +208,19 @@ class MainActivity : AppCompatActivity() {
         beginShare(room)
     }
 
-    /** Pide el permiso de captura; al aceptarlo arranca el servicio en primer plano. */
+    /** Pide primero permiso de audio (para el sonido interno) y luego proyección de pantalla. */
     private fun beginShare(room: String) {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            pendingAudioRoom = room
+            audioPermission.launch(Manifest.permission.RECORD_AUDIO)
+        } else {
+            launchProjectionIntent(room)
+        }
+    }
+
+    private fun launchProjectionIntent(room: String) {
         pendingRoom = room
         val manager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         projectionLauncher.launch(manager.createScreenCaptureIntent())
