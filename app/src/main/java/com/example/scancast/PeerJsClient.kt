@@ -63,7 +63,7 @@ class PeerJsSender(
         const val KIND_MEDIA = "media"
         const val KIND_DATA = "data"
         const val MAX_TRIES = 6
-        const val MAX_BITRATE_BPS = 6_000_000
+        const val MAX_BITRATE_BPS = 20_000_000
     }
 
     private val main = Handler(Looper.getMainLooper())
