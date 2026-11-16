@@ -338,6 +338,8 @@ private class InternalAudioDeviceModule(
     private val delegate = JavaAudioDeviceModule.builder(context)
         .setUseHardwareAcousticEchoCanceler(false)
         .setUseHardwareNoiseSuppressor(false)
+        .setAudioSampleRate(48000)
+        .setAudioSources(AudioManager.STREAM_MUSIC)
         .createAudioDeviceModule()
 
     @Volatile private var recording = false
