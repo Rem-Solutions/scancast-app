@@ -17,6 +17,7 @@ import org.webrtc.*
 import org.webrtc.audio.*
 import java.lang.reflect.*
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import kotlin.concurrent.thread
 import kotlin.math.*
 
@@ -25,6 +26,7 @@ class ScreenCaptureService : Service() {
     companion object {
         const val ACTION_START = "com.example.scancast.START"
         const val ACTION_STOP = "com.example.scancast.STOP"
+        const val ACTION_SET_MUTE = "com.example.scancast.SET_MUTE"
         private const val EXTRA_ROOM = "room"
         private const val EXTRA_DATA = "projection_data"
         private const val EXTRA_MUTE = "mute_phone"
@@ -40,6 +42,13 @@ class ScreenCaptureService : Service() {
                 .putExtra(EXTRA_DATA, projectionData)
                 .putExtra(EXTRA_MUTE, mutePhone)
             ContextCompat.startForegroundService(context, intent)
+        }
+
+        fun setMute(context: Context, mutePhone: Boolean) {
+            val intent = Intent(context, ScreenCaptureService::class.java)
+                .setAction(ACTION_SET_MUTE)
+                .putExtra(EXTRA_MUTE, mutePhone)
+            context.startService(intent)
         }
 
         fun stop(context: Context) {
@@ -60,6 +69,7 @@ class ScreenCaptureService : Service() {
     private var sender: PeerJsSender? = null
     private var finishing = false
     private var previousVolume = -1
+    private var isPhoneMuted = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -94,24 +104,43 @@ class ScreenCaptureService : Service() {
                 }
                 startSession(room, data, mutePhone)
             }
+            ACTION_SET_MUTE -> {
+                val mutePhone = intent.getBooleanExtra(EXTRA_MUTE, true)
+                applyPhoneMute(mutePhone)
+            }
             ACTION_STOP -> stopSession()
             else -> stopSelf()
         }
         return START_NOT_STICKY
     }
 
+    private fun applyPhoneMute(mute: Boolean) {
+        try {
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            if (mute) {
+                if (!isPhoneMuted) {
+                    previousVolume = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+                }
+                // Dejamos en nivel 1 (casi inaudible en el altavoz) para que Android NO corte
+                // la señal interna de AudioPlaybackCapture, y compensamos con ganancia digital.
+                am.setStreamVolume(AudioManager.STREAM_MUSIC, 1, 0)
+                customAdm?.gainMultiplier = 6.0f
+                isPhoneMuted = true
+            } else {
+                if (previousVolume != -1) {
+                    am.setStreamVolume(AudioManager.STREAM_MUSIC, previousVolume, 0)
+                    previousVolume = -1
+                }
+                customAdm?.gainMultiplier = 2.5f
+                isPhoneMuted = false
+            }
+        } catch (_: Throwable) {}
+    }
+
     private fun startSession(room: String, projectionData: Intent, mutePhone: Boolean) {
         releaseMedia()
         finishing = false
         ShareState.update(ShareStatus.CONNECTING, "")
-
-        if (mutePhone) {
-            try {
-                val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-                previousVolume = am.getStreamVolume(AudioManager.STREAM_MUSIC)
-                am.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
-            } catch (_: Throwable) {}
-        }
 
         try {
             PeerConnectionFactory.initialize(
@@ -126,6 +155,8 @@ class ScreenCaptureService : Service() {
                 extractMediaProjection(screenCapturer)
             }.also { customAdm = it }
 
+            applyPhoneMute(mutePhone)
+
             val peerFactory = PeerConnectionFactory.builder()
                 .setAudioDeviceModule(adm)
                 .setVideoEncoderFactory(DefaultVideoEncoderFactory(egl.eglBaseContext, true, true))
@@ -139,7 +170,9 @@ class ScreenCaptureService : Service() {
                 mandatory.add(MediaConstraints.KeyValuePair("googHighpassFilter", "false"))
             }
             val aSource = peerFactory.createAudioSource(audioConstraints).also { audioSource = it }
-            val aTrack = peerFactory.createAudioTrack("audio0", aSource).also { audioTrack = it }
+            val aTrack = peerFactory.createAudioTrack("audio0", aSource).apply {
+                setVolume(4.0) // Refuerzo extra en el track WebRTC
+            }.also { audioTrack = it }
 
             val source = peerFactory.createVideoSource(true).also { videoSource = it }
             val helper = SurfaceTextureHelper.create("ScreenCaptureThread", egl.eglBaseContext).also { surfaceHelper = it }
@@ -185,12 +218,14 @@ class ScreenCaptureService : Service() {
     }
 
     private fun releaseMedia() {
-        if (previousVolume != -1) {
+        if (isPhoneMuted && previousVolume != -1) {
             try {
                 (getSystemService(Context.AUDIO_SERVICE) as AudioManager).setStreamVolume(AudioManager.STREAM_MUSIC, previousVolume, 0)
             } catch (_: Throwable) {}
-            previousVolume = -1
         }
+        previousVolume = -1
+        isPhoneMuted = false
+
         try { sender?.shutdownNow() } catch (_: Throwable) {}; sender = null
         try { capturer?.stopCapture() } catch (_: Throwable) {}
         try { capturer?.dispose() } catch (_: Throwable) {}; capturer = null
@@ -265,9 +300,10 @@ private class InternalAudioDeviceModule(
         .setUseHardwareAcousticEchoCanceler(false)
         .setUseHardwareNoiseSuppressor(false)
         .setSampleRate(48000)
-        .setAudioSource(MediaRecorder.AudioSource.UNPROCESSED)
+        .setAudioSource(MediaRecorder.AudioSource.DEFAULT)
         .createAudioDeviceModule()
 
+    @Volatile var gainMultiplier: Float = 3.5f
     @Volatile private var recording = false
     private var audioRecord: AudioRecord? = null
 
@@ -334,12 +370,28 @@ private class InternalAudioDeviceModule(
                     if (directBuffer != null && nativeRecPtr != 0L) {
                         directBuffer.clear()
                         val read = record.read(directBuffer, directBuffer.capacity())
-                        if (read > 0) nativeDataMethod.invoke(webRtcRecord, read, nativeRecPtr)
+                        if (read > 0) {
+                            val gain = gainMultiplier
+                            if (gain > 1.01f) {
+                                amplifyPcm16(directBuffer, read, gain)
+                            }
+                            nativeDataMethod.invoke(webRtcRecord, read, nativeRecPtr)
+                        }
                     } else {
                         Thread.sleep(20)
                     }
                 }
             } catch (_: Throwable) {}
+        }
+    }
+
+    private fun amplifyPcm16(buffer: ByteBuffer, bytesRead: Int, gain: Float) {
+        val shortBuf = buffer.duplicate().order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+        val samples = bytesRead / 2
+        for (i in 0 until samples) {
+            val amplified = (shortBuf.get(i) * gain).toInt()
+            val clamped = amplified.coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
+            shortBuf.put(i, clamped)
         }
     }
 }
