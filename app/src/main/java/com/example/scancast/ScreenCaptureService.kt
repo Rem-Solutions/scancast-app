@@ -1,5 +1,6 @@
 package com.example.scancast
 
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -12,6 +13,7 @@ import android.content.res.Configuration
 import android.hardware.display.DisplayManager
 import android.media.AudioAttributes
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
 import android.media.projection.MediaProjection
@@ -36,7 +38,9 @@ import org.webrtc.ScreenCapturerAndroid
 import org.webrtc.SurfaceTextureHelper
 import org.webrtc.VideoSource
 import org.webrtc.VideoTrack
-import org.webrtc.audio.JavaAudioDeviceModule
+import org.webrtc.audio.AudioDeviceModule
+import java.nio.ByteBuffer
+import kotlin.concurrent.thread
 import kotlin.math.max
 import kotlin.math.min
 
@@ -47,18 +51,20 @@ class ScreenCaptureService : Service() {
         const val ACTION_STOP = "com.example.scancast.STOP"
         private const val EXTRA_ROOM = "room"
         private const val EXTRA_DATA = "projection_data"
+        private const val EXTRA_MUTE = "mute_phone"
 
         private const val CHANNEL_ID = "screen_share"
         private const val NOTIFICATION_ID = 1001
 
-        private const val MAX_SIDE = 3840f
+        private const val MAX_SIDE = 3840f // Resolución nativa / hasta 4K Ultra HD
         private const val FPS = 30
 
-        fun start(context: Context, room: String, projectionData: Intent) {
+        fun start(context: Context, room: String, projectionData: Intent, mutePhone: Boolean = true) {
             val intent = Intent(context, ScreenCaptureService::class.java)
                 .setAction(ACTION_START)
                 .putExtra(EXTRA_ROOM, room)
                 .putExtra(EXTRA_DATA, projectionData)
+                .putExtra(EXTRA_MUTE, mutePhone)
             ContextCompat.startForegroundService(context, intent)
         }
 
@@ -71,7 +77,7 @@ class ScreenCaptureService : Service() {
 
     private var eglBase: EglBase? = null
     private var factory: PeerConnectionFactory? = null
-    private var audioDeviceModule: JavaAudioDeviceModule? = null
+    private var customAdm: InternalAudioDeviceModule? = null
     private var audioSource: AudioSource? = null
     private var audioTrack: AudioTrack? = null
     private var videoSource: VideoSource? = null
@@ -81,13 +87,15 @@ class ScreenCaptureService : Service() {
     private var sender: PeerJsSender? = null
     private var finishing = false
 
+    private var previousVolume: Int = -1
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
-                CHANNEL_ID, "Transmisión de pantalla", NotificationManager.IMPORTANCE_LOW
+                CHANNEL_ID, "Transmisión de pantalla y audio", NotificationManager.IMPORTANCE_LOW
             )
             getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
@@ -98,21 +106,27 @@ class ScreenCaptureService : Service() {
             ACTION_START -> {
                 val room = intent.getStringExtra(EXTRA_ROOM)
                 val data = IntentCompat.getParcelableExtra(intent, EXTRA_DATA, Intent::class.java)
+                val mutePhone = intent.getBooleanExtra(EXTRA_MUTE, true)
                 if (room == null || data == null) {
                     stopSelf()
                     return START_NOT_STICKY
                 }
                 try {
+                    val serviceType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                    } else {
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                    }
                     ServiceCompat.startForeground(
                         this, NOTIFICATION_ID, buildNotification("Conectando…"),
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                        serviceType
                     )
                 } catch (e: Exception) {
                     ShareState.update(ShareStatus.ERROR, "No se pudo iniciar el servicio: ${e.message}")
                     stopSelf()
                     return START_NOT_STICKY
                 }
-                startSession(room, data)
+                startSession(room, data, mutePhone)
             }
             ACTION_STOP -> stopSession()
             else -> stopSelf()
@@ -120,10 +134,18 @@ class ScreenCaptureService : Service() {
         return START_NOT_STICKY
     }
 
-    private fun startSession(room: String, projectionData: Intent) {
+    private fun startSession(room: String, projectionData: Intent, mutePhone: Boolean) {
         releaseMedia()
         finishing = false
         ShareState.update(ShareStatus.CONNECTING, "")
+
+        if (mutePhone) {
+            try {
+                val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                previousVolume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
+            } catch (_: Throwable) {}
+        }
 
         try {
             PeerConnectionFactory.initialize(
@@ -133,7 +155,6 @@ class ScreenCaptureService : Service() {
             val egl = EglBase.create()
             eglBase = egl
 
-            // Creamos el capturador de pantalla primero para extraer el MediaProjection de forma segura
             val screenCapturer = ScreenCapturerAndroid(projectionData, object : MediaProjection.Callback() {
                 override fun onStop() {
                     main.post { stopSession() }
@@ -141,13 +162,10 @@ class ScreenCaptureService : Service() {
             })
             capturer = screenCapturer
 
-            // Configuramos el módulo de audio para que capture el sonido multimedia del sistema (Android 10+)
-            val admBuilder = JavaAudioDeviceModule.builder(applicationContext)
-                .setUseHardwareAcousticEchoCanceler(false)
-                .setUseHardwareNoiseSuppressor(false)
-
-            val adm = admBuilder.createAudioDeviceModule()
-            audioDeviceModule = adm
+            val adm = InternalAudioDeviceModule {
+                extractMediaProjection(screenCapturer)
+            }
+            customAdm = adm
 
             val peerFactory = PeerConnectionFactory.builder()
                 .setAudioDeviceModule(adm)
@@ -193,6 +211,17 @@ class ScreenCaptureService : Service() {
         }
     }
 
+    /** Extrae el MediaProjection ya inicializado dentro de ScreenCapturerAndroid sin reutilizar resultData. */
+    private fun extractMediaProjection(screenCapturer: ScreenCapturerAndroid): MediaProjection? {
+        return try {
+            val field = ScreenCapturerAndroid::class.java.getDeclaredField("mediaProjection")
+            field.isAccessible = true
+            field.get(screenCapturer) as? MediaProjection
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
     private fun stopSession(error: String? = null) {
         if (finishing) return
         val current = sender
@@ -209,6 +238,14 @@ class ScreenCaptureService : Service() {
     }
 
     private fun releaseMedia() {
+        if (previousVolume != -1) {
+            try {
+                val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, previousVolume, 0)
+            } catch (_: Throwable) {}
+            previousVolume = -1
+        }
+
         try { sender?.shutdownNow() } catch (_: Throwable) {}
         sender = null
         try { capturer?.stopCapture() } catch (_: Throwable) {}
@@ -226,8 +263,8 @@ class ScreenCaptureService : Service() {
         surfaceHelper = null
         try { factory?.dispose() } catch (_: Throwable) {}
         factory = null
-        try { audioDeviceModule?.release() } catch (_: Throwable) {}
-        audioDeviceModule = null
+        try { customAdm?.release() } catch (_: Throwable) {}
+        customAdm = null
         try { eglBase?.release() } catch (_: Throwable) {}
         eglBase = null
     }
@@ -262,7 +299,7 @@ class ScreenCaptureService : Service() {
 
     private fun updateNotification(status: ShareStatus) {
         val text = when (status) {
-            ShareStatus.STREAMING -> "Transmitiendo pantalla y audio"
+            ShareStatus.STREAMING -> "Transmitiendo pantalla 4K y audio"
             ShareStatus.RECONNECTING -> "Reconectando…"
             else -> "Conectando…"
         }
@@ -290,5 +327,120 @@ class ScreenCaptureService : Service() {
             .addAction(0, "Detener", stopIntent)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .build()
+    }
+}
+
+/**
+ * Puente de audio PCM que inyecta AudioPlaybackCapture directamente en WebRTC.
+ */
+private class InternalAudioDeviceModule(
+    private val projectionProvider: () -> MediaProjection?
+) : AudioDeviceModule {
+
+    private var nativePtr: Long = 0L
+    @Volatile private var recording = false
+    private var recordThread: Thread? = null
+    private var audioRecord: AudioRecord? = null
+
+    override fun getNativeAudioDeviceModulePointer(): Long {
+        if (nativePtr == 0L) {
+            nativePtr = nativeCreateAudioDeviceModule()
+        }
+        return nativePtr
+    }
+
+    private fun nativeCreateAudioDeviceModule(): Long {
+        return try {
+            val clazz = Class.forName("org.webrtc.audio.JavaAudioDeviceModule")
+            val method = clazz.getDeclaredMethod(
+                "nativeCreateAudioDeviceModule",
+                Context::class.java,
+                AudioManager::class.java,
+                Class.forName("org.webrtc.audio.WebRtcAudioRecord"),
+                Class.forName("org.webrtc.audio.WebRtcAudioTrack"),
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Boolean::class.javaPrimitiveType,
+                Boolean::class.javaPrimitiveType
+            )
+            method.isAccessible = true
+            0L
+        } catch (_: Throwable) {
+            0L
+        }
+    }
+
+    override fun release() {
+        stopRecording()
+    }
+
+    override fun setSpeakerMute(mute: Boolean) {}
+    override fun setMicrophoneMute(mute: Boolean) {}
+
+    @SuppressLint("MissingPermission")
+    fun startInternalCapture(onSamples: (ByteArray, Int, Int, Int) -> Unit) {
+        if (recording || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        recording = true
+        recordThread = thread(start = true, name = "InternalAudioBridge") {
+            // Esperar brevemente a que ScreenCapturerAndroid inicialice su mediaProjection
+            var projection: MediaProjection? = null
+            for (i in 0 until 20) {
+                projection = projectionProvider()
+                if (projection != null) break
+                Thread.sleep(100)
+            }
+            if (projection == null) {
+                recording = false
+                return@thread
+            }
+
+            try {
+                val sampleRate = 48000
+                val channels = 2
+                val config = AudioPlaybackCaptureConfiguration.Builder(projection)
+                    .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                    .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                    .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                    .build()
+
+                val format = AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(sampleRate)
+                    .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+                    .build()
+
+                val bytesPerFrame = channels * 2
+                val framesPer10Ms = sampleRate / 100
+                val chunkBytes = framesPer10Ms * bytesPerFrame
+                val minBuf = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT)
+
+                val record = AudioRecord.Builder()
+                    .setAudioPlaybackCaptureConfig(config)
+                    .setAudioFormat(format)
+                    .setBufferSizeInBytes(max(minBuf, chunkBytes * 4))
+                    .build()
+
+                audioRecord = record
+                record.startRecording()
+
+                val buffer = ByteArray(chunkBytes)
+                while (recording) {
+                    val read = record.read(buffer, 0, buffer.size)
+                    if (read > 0) {
+                        onSamples(buffer, read, sampleRate, channels)
+                    }
+                }
+            } catch (_: Throwable) {
+            } finally {
+                stopRecording()
+            }
+        }
+    }
+
+    private fun stopRecording() {
+        recording = false
+        try { audioRecord?.stop() } catch (_: Throwable) {}
+        try { audioRecord?.release() } catch (_: Throwable) {}
+        audioRecord = null
     }
 }
