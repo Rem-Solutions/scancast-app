@@ -3,7 +3,6 @@ package com.example.scancast
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
-import android.media.AudioManager
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
@@ -102,20 +101,16 @@ class MainActivity : AppCompatActivity() {
         scannerOverlay = findViewById(R.id.scannerOverlay)
         previewView = findViewById(R.id.previewView)
 
-        // Creamos el interruptor de "Silenciar celular" dinámicamente debajo de stopButton
         mutePhoneSwitch = SwitchMaterial(this).apply {
             text = "Silenciar altavoz del celular al transmitir"
             isChecked = true
             setPadding(0, 24, 0, 24)
             setOnCheckedChangeListener { _, isChecked ->
-                if (ShareState.status == ShareStatus.STREAMING || ShareState.status == ShareStatus.CONNECTING) {
-                    val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-                    if (isChecked) {
-                        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
-                    } else {
-                        val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-                        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, maxVol / 2, 0)
-                    }
+                if (ShareState.status == ShareStatus.STREAMING ||
+                    ShareState.status == ShareStatus.CONNECTING ||
+                    ShareState.status == ShareStatus.RECONNECTING
+                ) {
+                    ScreenCaptureService.setMute(this@MainActivity, isChecked)
                 }
             }
         }
