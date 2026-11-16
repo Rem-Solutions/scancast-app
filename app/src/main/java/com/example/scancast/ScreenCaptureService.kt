@@ -52,7 +52,7 @@ class ScreenCaptureService : Service() {
     private var factory: PeerConnectionFactory? = null
     private var customAdm: InternalAudioDeviceModule? = null
     private var audioSource: AudioSource? = null
-    private var audioTrack: AudioTrack? = null
+    private var audioTrack: org.webrtc.AudioTrack? = null
     private var videoSource: VideoSource? = null
     private var videoTrack: VideoTrack? = null
     private var surfaceHelper: SurfaceTextureHelper? = null
