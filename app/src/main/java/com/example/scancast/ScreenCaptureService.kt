@@ -51,7 +51,7 @@ class ScreenCaptureService : Service() {
         private const val CHANNEL_ID = "screen_share"
         private const val NOTIFICATION_ID = 1001
 
-        private const val MAX_SIDE = 1280f
+        private const val MAX_SIDE = 3840f
         private const val FPS = 30
 
         fun start(context: Context, room: String, projectionData: Intent) {
