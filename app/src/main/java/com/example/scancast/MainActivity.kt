@@ -88,7 +88,7 @@ class MainActivity : AppCompatActivity() {
 
         mutePhoneSwitch = SwitchMaterial(this).apply {
             text = "Silenciar altavoz del celular al transmitir"
-            isChecked = true
+            isChecked = false
             setPadding(0, 24, 0, 24)
             setOnCheckedChangeListener { _, isChecked ->
                 if (ShareState.status != ShareStatus.IDLE && ShareState.status != ShareStatus.ERROR) {
