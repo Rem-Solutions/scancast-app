@@ -305,7 +305,11 @@ class ScreenCaptureService : Service() {
 
     private fun updateNotification(status: ShareStatus) {
         val text = when (status) {
-            ShareStatus.STREAMING -> "Transmitiendo pantalla y audio"
+            ShareStatus.STREAMING -> when (audioBridge?.mode) {
+                "directo" -> "Transmitiendo pantalla + audio interno"
+                "respaldo" -> "Transmitiendo pantalla + audio interno (modo respaldo)"
+                else -> "Transmitiendo pantalla (sin audio)"
+            }
             ShareStatus.RECONNECTING -> "Reconectando…"
             else -> "Conectando…"
         }
